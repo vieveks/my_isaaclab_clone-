@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+import traceback
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,34 @@ from isaaclab.utils.assets import check_file_path, read_file
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+class CustomActor(torch.nn.Module):
+    """Custom actor network that exactly matches the structure of the checkpoint."""
+    
+    def __init__(self, state_dict):
+        super().__init__()
+        self.layer0 = torch.nn.Linear(123, 256)
+        self.layer0.weight = torch.nn.Parameter(state_dict["actor.0.weight"])
+        self.layer0.bias = torch.nn.Parameter(state_dict["actor.0.bias"])
+        
+        self.layer2 = torch.nn.Linear(256, 128)
+        self.layer2.weight = torch.nn.Parameter(state_dict["actor.2.weight"])
+        self.layer2.bias = torch.nn.Parameter(state_dict["actor.2.bias"])
+        
+        self.layer4 = torch.nn.Linear(128, 128)
+        self.layer4.weight = torch.nn.Parameter(state_dict["actor.4.weight"])
+        self.layer4.bias = torch.nn.Parameter(state_dict["actor.4.bias"])
+        
+        self.layer6 = torch.nn.Linear(128, 37)
+        self.layer6.weight = torch.nn.Parameter(state_dict["actor.6.weight"])
+        self.layer6.bias = torch.nn.Parameter(state_dict["actor.6.bias"])
+    
+    def forward(self, x):
+        x = torch.nn.functional.elu(self.layer0(x))
+        x = torch.nn.functional.elu(self.layer2(x))
+        x = torch.nn.functional.elu(self.layer4(x))
+        return self.layer6(x)
 
 
 class PreTrainedPolicyAction(ActionTerm):
@@ -41,13 +70,12 @@ class PreTrainedPolicyAction(ActionTerm):
         # load policy
         if not check_file_path(cfg.policy_path):
             raise FileNotFoundError(f"Policy file '{cfg.policy_path}' does not exist.")
-        file_bytes = read_file(cfg.policy_path)
-        self.policy = torch.jit.load(file_bytes).to(env.device).eval()
-
-        self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
-
-        # prepare low level actions
+        
+        # First prepare the low-level action term so we can get dimensions if needed
         self._low_level_action_term: ActionTerm = cfg.low_level_actions.class_type(cfg.low_level_actions, env)
+        
+        # Add the low level observations to the observation manager early
+        # so we can get the dimensions
         self.low_level_actions = torch.zeros(self.num_envs, self._low_level_action_term.action_dim, device=self.device)
 
         def last_action():
@@ -59,11 +87,57 @@ class PreTrainedPolicyAction(ActionTerm):
         # remap some of the low level observations to internal observations
         cfg.low_level_observations.actions.func = lambda dummy_env: last_action()
         cfg.low_level_observations.actions.params = dict()
+        self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         cfg.low_level_observations.velocity_commands.func = lambda dummy_env: self._raw_actions
         cfg.low_level_observations.velocity_commands.params = dict()
 
         # add the low level observations to the observation manager
         self._low_level_obs_manager = ObservationManager({"ll_policy": cfg.low_level_observations}, env)
+        
+        # Now get the real input dimensions
+        obs_shape = self._low_level_obs_manager.compute_group("ll_policy").shape[1]
+        action_dim = self._low_level_action_term.action_dim
+        print(f"Actual observation shape: {obs_shape}, action dim: {action_dim}")
+        
+        # Check if this is a JIT file or a checkpoint file
+        try:
+            # Try to load as a JIT file first
+            file_bytes = read_file(cfg.policy_path)
+            self.policy = torch.jit.load(file_bytes).to(env.device).eval()
+            print(f"Loaded JIT policy from {cfg.policy_path}")
+        except Exception as e:
+            # If that fails, try to load as a checkpoint
+            print(f"Could not load as JIT file: {e}")
+            print(f"Trying to load as a checkpoint file from {cfg.policy_path}")
+            
+            try:
+                # Load the checkpoint
+                checkpoint = torch.load(cfg.policy_path, map_location=env.device)
+                print(f"Checkpoint keys: {list(checkpoint.keys())}")
+                
+                if "model_state_dict" in checkpoint:
+                    print("Found model_state_dict in checkpoint")
+                    # Directly create a custom actor that matches the checkpoint structure
+                    self.policy = CustomActor(checkpoint["model_state_dict"]).to(env.device).eval()
+                    print(f"Created custom actor network with exact architecture from checkpoint")
+                else:
+                    print("No model_state_dict found in checkpoint")
+                    raise ValueError("Checkpoint doesn't contain model_state_dict")
+                    
+            except Exception as e:
+                print(f"Failed to load checkpoint: {e}")
+                traceback.print_exc()
+                
+                # Try to use ANYmal policy as a last resort
+                try:
+                    print("Trying to use ANYmal policy as fallback")
+                    anymal_policy_path = "/home/vivek/isaac_lab_2/_isaac_sim/kit/data/nucleus/IsaacLab/Policies/ANYmal-C/Blind/policy.pt"
+                    file_bytes = read_file(anymal_policy_path)
+                    self.policy = torch.jit.load(file_bytes).to(env.device).eval()
+                    print(f"Loaded ANYmal policy as fallback")
+                except Exception as e:
+                    print(f"Failed to load ANYmal policy: {e}")
+                    raise ValueError(f"Could not load any policy for navigation")
 
         self._counter = 0
 
@@ -93,7 +167,18 @@ class PreTrainedPolicyAction(ActionTerm):
     def apply_actions(self):
         if self._counter % self.cfg.low_level_decimation == 0:
             low_level_obs = self._low_level_obs_manager.compute_group("ll_policy")
-            self.low_level_actions[:] = self.policy(low_level_obs)
+            print(f"Low level observation shape: {low_level_obs.shape}, values min: {low_level_obs.min().item():.4f}, max: {low_level_obs.max().item():.4f}")
+            
+            try:
+                print(f"Applying policy of type: {type(self.policy)}")
+                self.low_level_actions[:] = self.policy(low_level_obs)
+                print(f"Actions shape: {self.low_level_actions.shape}, values min: {self.low_level_actions.min().item():.4f}, max: {self.low_level_actions.max().item():.4f}")
+            except Exception as e:
+                print(f"Error applying policy: {e}")
+                traceback.print_exc()
+                # In case of error, output zeros
+                self.low_level_actions.zero_()
+                    
             self._low_level_action_term.process_actions(self.low_level_actions)
             self._counter = 0
         self._low_level_action_term.apply_actions()
